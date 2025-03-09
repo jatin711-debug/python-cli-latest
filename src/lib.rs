@@ -26,38 +26,36 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Install {
-        packages: Vec<String>,
-    },
-    Delete {
-        name: String,
-    },
-    Update {
-        name: String,
-        version: String,
-    },
+    Install { packages: Vec<String> },
+    Delete { name: String },
+    Update { name: String, version: String },
     List,
 }
 
 fn get_python_executable() -> String {
-    let commands = ["python3", "python"];
-    
-    for cmd in &commands {
-        let output = Command::new(cmd)
-            .arg("-c")
-            .arg("import sys; print(sys.executable)")
-            .output();
-        
-        if let Ok(output) = output {
-            if output.status.success() {
-                return String::from_utf8(output.stdout)
-                    .unwrap_or_else(|_| panic!("Invalid UTF-8 in Python path"))
-                    .trim()
-                    .to_string();
+    if cfg!(test) {
+        // Return mock path during tests
+        "mock_python".to_string()
+    } else {
+        let commands = ["python3", "python"];
+
+        for cmd in &commands {
+            let output = Command::new(cmd)
+                .arg("-c")
+                .arg("import sys; print(sys.executable)")
+                .output();
+
+            if let Ok(output) = output {
+                if output.status.success() {
+                    return String::from_utf8(output.stdout)
+                        .unwrap_or_else(|_| panic!("Invalid UTF-8 in Python path"))
+                        .trim()
+                        .to_string();
+                }
             }
         }
+        panic!("Failed to find Python executable");
     }
-    panic!("Failed to find Python executable");
 }
 
 fn get_installed_version(python: &str, name: &str) -> String {
@@ -83,7 +81,8 @@ fn get_installed_version(python: &str, name: &str) -> String {
 pub fn load_packages() -> PackageRegistry {
     let path = PathBuf::from("packages.json");
     if path.exists() {
-        let file = File::open(&path).unwrap_or_else(|_| panic!("Failed to open {}", path.display()));
+        let file =
+            File::open(&path).unwrap_or_else(|_| panic!("Failed to open {}", path.display()));
         let reader = BufReader::new(file);
         serde_json::from_reader(reader).unwrap_or_else(|_| PackageRegistry {
             packages: HashMap::new(),
@@ -97,14 +96,15 @@ pub fn load_packages() -> PackageRegistry {
 
 pub fn save_packages(registry: &PackageRegistry) {
     let path = PathBuf::from("packages.json");
-    let file = File::create(&path).unwrap_or_else(|_| panic!("Failed to create {}", path.display()));
+    let file =
+        File::create(&path).unwrap_or_else(|_| panic!("Failed to create {}", path.display()));
     let writer = BufWriter::new(file);
     serde_json::to_writer_pretty(writer, registry).expect("Failed to write packages");
 }
 
 pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
     let python = get_python_executable();
-    
+
     let package_specs: Vec<String> = packages
         .iter()
         .map(|pkg| {
@@ -112,7 +112,7 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
             version.map_or(name.clone(), |v| format!("{}=={}", name, v))
         })
         .collect();
-    
+
     let status = Command::new(&python)
         .arg("-m")
         .arg("pip")
@@ -120,12 +120,12 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
         .args(&package_specs)
         .status()
         .expect("Failed to execute pip install");
-    
+
     if status.success() {
         for spec in packages {
             let (name, version_option) = parse_package_spec(spec);
             let version = version_option.unwrap_or_else(|| get_installed_version(&python, &name));
-            
+
             registry.packages.insert(
                 name.clone(),
                 Package {
@@ -142,7 +142,7 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
 
 pub fn delete_package(name: &str, registry: &mut PackageRegistry) {
     let python = get_python_executable();
-    
+
     let status = Command::new(&python)
         .arg("-m")
         .arg("pip")
@@ -162,7 +162,7 @@ pub fn delete_package(name: &str, registry: &mut PackageRegistry) {
 
 pub fn update_package(name: &str, version: &str, registry: &mut PackageRegistry) {
     let python = get_python_executable();
-    
+
     let status = Command::new(&python)
         .arg("-m")
         .arg("pip")
@@ -192,7 +192,7 @@ pub fn list_packages(registry: &PackageRegistry) {
         println!("No packages installed");
         return;
     }
-    
+
     println!("Installed packages:");
     for (name, pkg) in &registry.packages {
         println!("- {} @ {}", name, pkg.version);
@@ -201,7 +201,7 @@ pub fn list_packages(registry: &PackageRegistry) {
 
 pub fn install_from_requirements(path: &str, registry: &mut PackageRegistry) {
     let python = get_python_executable();
-    
+
     let status = Command::new(&python)
         .arg("-m")
         .arg("pip")
@@ -214,17 +214,17 @@ pub fn install_from_requirements(path: &str, registry: &mut PackageRegistry) {
     if status.success() {
         let file = File::open(path).unwrap_or_else(|_| panic!("Failed to open {}", path));
         let reader = BufReader::new(file);
-        
+
         for line in reader.lines() {
             let line = line.expect("Error reading line");
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            
+
             let (name, version_option) = parse_package_spec(line);
             let version = version_option.unwrap_or_else(|| get_installed_version(&python, &name));
-            
+
             registry.packages.insert(
                 name.clone(),
                 Package {
@@ -247,3 +247,4 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
         _ => panic!("Invalid package specification: {}", spec),
     }
 }
+
