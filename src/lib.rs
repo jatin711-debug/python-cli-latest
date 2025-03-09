@@ -39,6 +39,47 @@ pub enum Commands {
     List,
 }
 
+fn get_python_executable() -> String {
+    let commands = ["python3", "python"];
+    
+    for cmd in &commands {
+        let output = Command::new(cmd)
+            .arg("-c")
+            .arg("import sys; print(sys.executable)")
+            .output();
+        
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8(output.stdout)
+                    .unwrap_or_else(|_| panic!("Invalid UTF-8 in Python path"))
+                    .trim()
+                    .to_string();
+            }
+        }
+    }
+    panic!("Failed to find Python executable");
+}
+
+fn get_installed_version(python: &str, name: &str) -> String {
+    let output = Command::new(python)
+        .arg("-m")
+        .arg("pip")
+        .arg("show")
+        .arg(name)
+        .output()
+        .unwrap_or_else(|_| panic!("Failed to check version for {}", name));
+
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|l| l.starts_with("Version: "))
+            .map(|l| l.replace("Version: ", "").trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    }
+}
+
 pub fn load_packages() -> PackageRegistry {
     let path = PathBuf::from("packages.json");
     if path.exists() {
@@ -61,27 +102,6 @@ pub fn save_packages(registry: &PackageRegistry) {
     serde_json::to_writer_pretty(writer, registry).expect("Failed to write packages");
 }
 
-fn get_python_executable() -> String {
-    let commands = ["python3", "python"];
-    
-    for cmd in &commands {
-        let output = Command::new(cmd)
-            .arg("-c")
-            .arg("import sys; print(sys.executable)")
-            .output();
-        
-        if let Ok(output) = output {
-            if output.status.success() {
-                let path = String::from_utf8(output.stdout)
-                    .expect("Invalid UTF-8 in Python executable path");
-                return path.trim().to_string();
-            }
-        }
-    }
-    
-    panic!("Failed to find Python executable");
-}
-
 pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
     let python = get_python_executable();
     
@@ -89,10 +109,7 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
         .iter()
         .map(|pkg| {
             let (name, version) = parse_package_spec(pkg);
-            match version {
-                Some(v) => format!("{}=={}", name, v),
-                None => name,
-            }
+            version.map_or(name.clone(), |v| format!("{}=={}", name, v))
         })
         .collect();
     
@@ -107,7 +124,8 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
     if status.success() {
         for spec in packages {
             let (name, version_option) = parse_package_spec(spec);
-            let version = version_option.unwrap_or_else(|| "latest".to_string());
+            let version = version_option.unwrap_or_else(|| get_installed_version(&python, &name));
+            
             registry.packages.insert(
                 name.clone(),
                 Package {
@@ -135,11 +153,8 @@ pub fn delete_package(name: &str, registry: &mut PackageRegistry) {
         .expect("Failed to execute pip uninstall");
 
     if status.success() {
-        if registry.packages.remove(name).is_some() {
-            println!("Removed package {}", name);
-        } else {
-            println!("Package {} not found in registry", name);
-        }
+        registry.packages.remove(name);
+        println!("Removed package {}", name);
     } else {
         eprintln!("Failed to uninstall package {}", name);
     }
@@ -158,19 +173,15 @@ pub fn update_package(name: &str, version: &str, registry: &mut PackageRegistry)
         .expect("Failed to execute pip install");
 
     if status.success() {
-        if let Some(pkg) = registry.packages.get_mut(name) {
-            pkg.version = version.to_string();
-            println!("Updated {} to version {}", name, version);
-        } else {
-            registry.packages.insert(
-                name.to_string(),
-                Package {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                },
-            );
-            println!("Installed new package {} @ {}", name, version);
-        }
+        let installed_version = get_installed_version(&python, name);
+        registry.packages.insert(
+            name.to_string(),
+            Package {
+                name: name.to_string(),
+                version: installed_version.clone(),
+            },
+        );
+        println!("Updated {} to version {}", name, installed_version);
     } else {
         eprintln!("Failed to update package {}", name);
     }
@@ -212,7 +223,7 @@ pub fn install_from_requirements(path: &str, registry: &mut PackageRegistry) {
             }
             
             let (name, version_option) = parse_package_spec(line);
-            let version = version_option.unwrap_or_else(|| "latest".to_string());
+            let version = version_option.unwrap_or_else(|| get_installed_version(&python, &name));
             
             registry.packages.insert(
                 name.clone(),
