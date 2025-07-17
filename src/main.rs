@@ -1,7 +1,8 @@
 use clap::Parser;
 use python_package_manager::{
-    install_from_requirements, install_packages, list_packages, 
-    delete_package, update_package, load_packages, save_packages, Cli, Commands
+    delete_package, install_from_requirements, install_from_requirements_parallel,
+    install_packages, install_packages_parallel, list_packages, load_packages, save_packages,
+    update_package, Cli, Commands,
 };
 
 fn main() {
@@ -9,10 +10,16 @@ fn main() {
     let mut package_registry = load_packages();
 
     match args.command {
-        Commands::Install { packages } => {
+        Commands::Install { packages, parallel } => {
             if packages.len() == 1 && packages[0].starts_with("-r=") {
                 let requirements_path = &packages[0][3..];
-                install_from_requirements(requirements_path, &mut package_registry);
+                if parallel {
+                    install_from_requirements_parallel(requirements_path, &mut package_registry);
+                } else {
+                    install_from_requirements(requirements_path, &mut package_registry);
+                }
+            } else if parallel {
+                install_packages_parallel(&packages, &mut package_registry);
             } else {
                 install_packages(&packages, &mut package_registry);
             }
@@ -27,6 +34,6 @@ fn main() {
             list_packages(&package_registry);
         }
     }
-    
+
     save_packages(&package_registry);
 }

@@ -1,10 +1,13 @@
 use clap::Subcommand;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Package {
@@ -26,9 +29,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Install { packages: Vec<String> },
-    Delete { name: String },
-    Update { name: String, version: String },
+    Install {
+        packages: Vec<String>,
+        #[arg(short = 'p', long = "parallel", help = "Install packages in parallel")]
+        parallel: bool,
+    },
+    Delete {
+        name: String,
+    },
+    Update {
+        name: String,
+        version: String,
+    },
     List,
 }
 
@@ -140,6 +152,96 @@ pub fn install_packages(packages: &[String], registry: &mut PackageRegistry) {
     }
 }
 
+pub fn install_packages_parallel(packages: &[String], registry: &mut PackageRegistry) {
+    if packages.is_empty() {
+        return;
+    }
+
+    let python = get_python_executable();
+
+    // Create progress bar
+    let pb = ProgressBar::new(packages.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    // Thread-safe registry wrapper
+    let registry_mutex = Arc::new(Mutex::new(registry));
+    let results: Vec<Result<(String, String, String), String>> = packages
+        .par_iter()
+        .map(|pkg| {
+            let (name, version) = parse_package_spec(pkg);
+            let package_spec = version
+                .as_ref()
+                .map_or(name.clone(), |v| format!("{}=={}", name, v));
+
+            pb.set_message(format!("Installing {}", name));
+
+            // Install individual package
+            let status = Command::new(&python)
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg(&package_spec)
+                .output();
+
+            match status {
+                Ok(output) => {
+                    if output.status.success() {
+                        let installed_version =
+                            version.unwrap_or_else(|| get_installed_version(&python, &name));
+                        pb.inc(1);
+                        Ok((name.clone(), installed_version, package_spec))
+                    } else {
+                        let error = String::from_utf8_lossy(&output.stderr);
+                        pb.inc(1);
+                        Err(format!("Failed to install {}: {}", name, error))
+                    }
+                }
+                Err(e) => {
+                    pb.inc(1);
+                    Err(format!("Failed to execute pip for {}: {}", name, e))
+                }
+            }
+        })
+        .collect();
+
+    pb.finish_with_message("Installation complete");
+
+    // Process results and update registry
+    let mut success_count = 0;
+    let mut failure_count = 0;
+
+    for result in results {
+        match result {
+            Ok((name, version, _)) => {
+                let mut reg = registry_mutex.lock().unwrap();
+                reg.packages.insert(
+                    name.clone(),
+                    Package {
+                        name: name.clone(),
+                        version: version.clone(),
+                    },
+                );
+                println!("✓ Successfully installed {} {}", name, version);
+                success_count += 1;
+            }
+            Err(error) => {
+                eprintln!("✗ {}", error);
+                failure_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nInstallation summary: {} succeeded, {} failed",
+        success_count, failure_count
+    );
+}
+
 pub fn delete_package(name: &str, registry: &mut PackageRegistry) {
     let python = get_python_executable();
 
@@ -200,42 +302,59 @@ pub fn list_packages(registry: &PackageRegistry) {
 }
 
 pub fn install_from_requirements(path: &str, registry: &mut PackageRegistry) {
-    let python = get_python_executable();
+    install_from_requirements_impl(path, registry, false);
+}
 
-    let status = Command::new(&python)
-        .arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg("-r")
-        .arg(path)
-        .status()
-        .expect("Failed to execute pip install");
+pub fn install_from_requirements_parallel(path: &str, registry: &mut PackageRegistry) {
+    install_from_requirements_impl(path, registry, true);
+}
 
-    if status.success() {
-        let file = File::open(path).unwrap_or_else(|_| panic!("Failed to open {}", path));
-        let reader = BufReader::new(file);
+fn install_from_requirements_impl(path: &str, registry: &mut PackageRegistry, parallel: bool) {
+    let file = File::open(path).unwrap_or_else(|_| panic!("Failed to open {}", path));
+    let reader = BufReader::new(file);
 
-        for line in reader.lines() {
-            let line = line.expect("Error reading line");
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let (name, version_option) = parse_package_spec(line);
-            let version = version_option.unwrap_or_else(|| get_installed_version(&python, &name));
-
-            registry.packages.insert(
-                name.clone(),
-                Package {
-                    name: name.clone(),
-                    version: version.clone(),
-                },
-            );
-            println!("Installed {} {}", name, version);
+    let mut packages = Vec::new();
+    for line in reader.lines() {
+        let line = line.expect("Error reading line");
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        packages.push(line.to_string());
+    }
+
+    if parallel {
+        install_packages_parallel(&packages, registry);
     } else {
-        eprintln!("Failed to install packages from {}", path);
+        let python = get_python_executable();
+
+        let status = Command::new(&python)
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("-r")
+            .arg(path)
+            .status()
+            .expect("Failed to execute pip install");
+
+        if status.success() {
+            for spec in packages {
+                let (name, version_option) = parse_package_spec(&spec);
+                let version =
+                    version_option.unwrap_or_else(|| get_installed_version(&python, &name));
+
+                registry.packages.insert(
+                    name.clone(),
+                    Package {
+                        name: name.clone(),
+                        version: version.clone(),
+                    },
+                );
+                println!("Installed {} {}", name, version);
+            }
+        } else {
+            eprintln!("Failed to install packages from {}", path);
+        }
     }
 }
 
@@ -247,4 +366,3 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
         _ => panic!("Invalid package specification: {}", spec),
     }
 }
-
