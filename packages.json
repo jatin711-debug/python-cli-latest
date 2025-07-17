@@ -1,3 +1,16 @@
 {
-  "packages": {}
+  "packages": {
+    "requests": {
+      "name": "requests",
+      "version": "2.32.3"
+    },
+    "flask": {
+      "name": "flask",
+      "version": "3.0.2"
+    },
+    "pandas": {
+      "name": "pandas",
+      "version": "2.3.0"
+    }
+  }
 }
